@@ -9,22 +9,35 @@ original arbitration and conflict accounting, and a batch may causally
 reference operations stored by earlier batches.
 
 Batch commits are atomic: validation, recomputation and the revision bump
-happen under a single lock, and the updated session is written to disk
-(temp file + ``os.replace``) before the lock is released.  Two concurrent
-submissions carrying the same expected revision therefore cannot both
-succeed -- the loser observes the bumped revision and gets a conflict.
+happen inside a critical section guarded by an in-process lock *and* a
+per-session ``flock`` file (``.{session_id}.lock`` next to the session
+file), and the record is re-read from disk inside that section.  The
+guarantee therefore holds not only between threads of one process but
+also between several service processes sharing ``SESSION_STORE_DIR``:
+two concurrent submissions carrying the same expected revision cannot
+both succeed -- the loser observes the bumped revision and gets a
+conflict.  The updated session is written to disk (temp file +
+``os.replace``) before the lock is released, and reads always come
+straight from disk (never from a per-process cache), so every process
+immediately sees the latest committed revision.
 
 Sessions are persisted as one JSON file per session inside a directory
 (``SESSION_STORE_DIR`` env var, default ``.sessions``), so they remain
-readable after the service (or ``docker compose``) restarts.
+readable after the service (or ``docker compose``) restarts.  The lock
+files are never deleted -- they are tiny, their number is bounded by the
+number of sessions, and deleting them would reintroduce an
+unlink/reopen race.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import threading
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -89,12 +102,18 @@ class BatchOutcome:
 
 
 class SessionStore:
-    """Directory-backed session store with atomic batch commits."""
+    """Directory-backed session store with atomic batch commits.
+
+    Commits are serialized both between the threads of this process (an
+    in-process lock) and between processes sharing the same directory (a
+    per-session ``flock`` file); the record is always re-read from disk
+    inside that locked section, so the revision check, recomputation and
+    persist step act as one cross-process critical section.
+    """
 
     def __init__(self, directory: str | os.PathLike[str]):
         self._dir = Path(directory)
         self._lock = threading.RLock()
-        self._cache: dict[str, SessionRecord] = {}
 
     @classmethod
     def from_env(cls) -> "SessionStore":
@@ -104,6 +123,27 @@ class SessionStore:
 
     def _path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.json"
+
+    def _lock_path(self, session_id: str) -> Path:
+        return self._dir / f".{session_id}.lock"
+
+    @contextlib.contextmanager
+    def _locked(self, session_id: str) -> Iterator[None]:
+        """Serialize one session's commit section across threads and processes.
+
+        The in-process lock orders the threads of this process; the
+        ``flock`` on the per-session lock file orders processes that share
+        the store directory.  The lock file is created on first use and
+        never deleted, so there is no unlink/reopen race.
+        """
+        with self._lock:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            with self._lock_path(session_id).open("a+b") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     def _persist(self, rec: SessionRecord) -> None:
         """Write ``rec`` atomically (temp file + rename within the directory)."""
@@ -116,21 +156,23 @@ class SessionStore:
         os.replace(tmp, self._path(rec.session_id))
 
     def _load(self, session_id: str) -> SessionRecord | None:
+        """Read the record straight from disk; nothing is cached per process.
+
+        Every call observes the latest committed revision, including
+        commits written by other processes sharing the directory.  The
+        atomic temp-file-plus-rename persist means a reader never sees a
+        partially written record, so reads need no file lock.
+        """
         if not _SESSION_ID_RE.fullmatch(session_id):
             return None
-        rec = self._cache.get(session_id)
-        if rec is not None:
-            return rec
         try:
             raw = self._path(session_id).read_text(encoding="utf-8")
         except OSError:
             return None
         try:
-            rec = SessionRecord.from_json(json.loads(raw))
+            return SessionRecord.from_json(json.loads(raw))
         except (KeyError, TypeError, ValueError):
             return None
-        self._cache[session_id] = rec
-        return rec
 
     # -- session lifecycle ----------------------------------------------
 
@@ -138,16 +180,15 @@ class SessionStore:
         """Create a session pinned to ``document``/``version`` at revision 0."""
         initial_version = dict(version or {})
         validate_and_dedupe([], initial_version)  # rejects negative entries
+        rec = SessionRecord(
+            session_id=uuid.uuid4().hex,
+            revision=0,
+            document=document,
+            version=initial_version,
+        )
         with self._lock:
-            rec = SessionRecord(
-                session_id=uuid.uuid4().hex,
-                revision=0,
-                document=document,
-                version=initial_version,
-            )
             self._persist(rec)
-            self._cache[rec.session_id] = rec
-            return rec
+        return rec
 
     def get(self, session_id: str) -> SessionRecord:
         with self._lock:
@@ -184,8 +225,15 @@ class SessionStore:
         A batch that contributes no new operation leaves the revision
         untouched; any validation or execution failure leaves the session
         untouched as well (no partial commits).
+
+        The record is re-read from disk and the revision check,
+        recomputation and persist all run inside the session's
+        cross-process lock, so two processes sharing the store directory
+        cannot both commit on top of the same revision.
         """
-        with self._lock:
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
             rec = self._load(session_id)
             if rec is None:
                 raise SessionNotFoundError(session_id)

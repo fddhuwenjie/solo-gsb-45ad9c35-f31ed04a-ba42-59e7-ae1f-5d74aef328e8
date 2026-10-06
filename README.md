@@ -19,9 +19,10 @@
   叶子来源映射；输入文档不会被修改。
 - **分批提交会话**：`POST /sessions` 创建会话，固定共同的初始文档与初始
   版本向量并返回修订号 0；`POST /sessions/{id}/batches` 凭期望修订号提交
-  非空操作批次，校验、重算与修订提交原子完成；`GET /sessions/{id}` 读取
-  最新修订号、文档、版本向量、冲突与墓碑。每次提交都从初始文档重算累计
-  日志（不把上次结果当作新基线），会话持久化到磁盘卷，重启后仍可读取。
+  非空操作批次，校验、重算与修订提交原子完成（多进程共享存储目录时同样
+  成立）；`GET /sessions/{id}` 读取最新修订号、文档、版本向量、冲突与
+  墓碑。每次提交都从初始文档重算累计日志（不把上次结果当作新基线），
+  会话持久化到磁盘卷，重启后仍可读取。
 
 ## 快速启动
 
@@ -599,11 +600,35 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   `expected_revision` 过期返回 `409`；会话不存在返回 `404`。这些失败
   都不会写入部分批次，会话保持原有修订与日志。
 - **并发提交**：同一 `expected_revision` 的并发提交只有一个能成功，
-  其余因修订号已推进而收到 `409`。
+  其余因修订号已推进而收到 `409`——该保证在共用同一 `SESSION_STORE_DIR`
+  的多个服务进程之间同样成立（见下文「共享存储目录下的并发调用」）。
 - **持久化**：每个会话以 JSON 文件存于 `SESSION_STORE_DIR`（默认
   `./.sessions`；docker compose 中设为 `/data/sessions`，挂载命名卷
   `session-data`），`docker compose restart` 或 `down` + `up` 之后
   会话仍可读取、可继续提交。
+
+### 共享存储目录下的并发调用
+
+多个服务进程（或多个容器挂载同一卷、`docker compose up --scale api=N`
+多副本）可以共用同一个 `SESSION_STORE_DIR`。此时提交路径在进程内锁之外
+再按会话加一把 `flock` 文件锁（存储目录下的 `.{session_id}.lock` 文件），
+并在持锁期间**重新从磁盘读取**会话：修订号检查、累计日志重算与原子落盘
+（临时文件 + `os.replace`）作为一个跨进程临界区整体生效。因此：
+
+- 两个进程都已读到修订号 0、随后各自以 `expected_revision=0` 提交不同
+  批次时，只有一笔成功，另一笔在锁内看到修订号已推进而返回 `409`；
+  不会出现后写覆盖先写的修订丢失。
+- 会话不做进程内缓存，`GET /sessions/{id}` 总是反映磁盘上最新已提交的
+  状态，任一进程都能立即读到成功批次与最新修订号。
+- 重传幂等、非法批次 `422`、过期修订号 `409`、会话不存在 `404` 的语义
+  与单进程完全一致，失败同样不落盘。
+- 锁文件随会话保留（不删除，避免 unlink/reopen 竞态），数量与会话数
+  相同；读取路径不加锁，靠原子替换保证不会读到写了一半的文件。
+
+注意：文件锁依赖本地 POSIX 文件系统（命名卷、本地磁盘均可）；把存储目录
+放到 NFS 等网络文件系统上前请自行评估锁语义。用 `--scale` 水平扩容时请
+移除固定的 `8000:8000` 端口映射（或置于反向代理之后），并为所有副本挂载
+同一个 `session-data` 卷。
 
 ### 可执行示例
 
@@ -714,14 +739,14 @@ app/
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
   query.py     # 受限 JSONPath 解析与求值（只读、单查询 10000 节点预算）
   resolve.py   # 跨文档 $ref 物化：覆盖层合并、引用链循环检测、叶子来源映射
-  sessions.py  # 分批会话：累计日志、原子提交（校验+重算+修订）、JSON 文件持久化
+  sessions.py  # 分批会话：累计日志、跨进程原子提交（文件锁内校验+重算+修订）、JSON 文件持久化
 tests/
   test_api.py            # 22 个 merge/apply 端到端测试
   test_exclude.py        # 29 个 merge/apply 排除裁剪端到端测试
   test_route_changes.py  # 30 个 route-changes 端到端测试
   test_query.py          # 73 个 /query 端到端测试
   test_resolve.py        # 37 个 /resolve 端到端测试
-  test_sessions.py       # 20 个分批会话端到端测试
+  test_sessions.py       # 22 个分批会话端到端测试
 conftest.py
 Dockerfile
 docker-compose.yml

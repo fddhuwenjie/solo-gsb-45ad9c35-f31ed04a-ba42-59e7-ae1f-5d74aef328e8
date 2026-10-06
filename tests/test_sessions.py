@@ -1,6 +1,7 @@
 """End-to-end tests for durable batched-submission sessions."""
 from __future__ import annotations
 
+import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -351,3 +352,96 @@ def test_session_survives_store_restart(tmp_path):
     assert resp.status_code == 422  # alice:2 was never submitted
     resp = submit(client, sid, 0, [op("carol", 1, {"carol": 1}, "/x", "set", 1)])
     assert resp.status_code == 409  # revision survived the restart too
+
+
+# ---------------------------------------------------------------------------
+# several processes sharing SESSION_STORE_DIR
+# ---------------------------------------------------------------------------
+
+def test_second_store_instance_observes_disk_state(tmp_path):
+    # two SessionStore objects over one directory behave like two service
+    # processes sharing SESSION_STORE_DIR: a commit by one is immediately
+    # visible to the other, and its stale expected revision conflicts
+    store_dir = str(tmp_path / "sessions")
+    store_a = SessionStore(store_dir)
+    store_b = SessionStore(store_dir)
+    rec = store_a.create({"count": 0}, {})
+    # both "processes" have read revision 0
+    assert store_a.get(rec.session_id).revision == 0
+    assert store_b.get(rec.session_id).revision == 0
+
+    winner = Operation(
+        actor="alice", seq=1, version={"alice": 1},
+        path="/count", action="set", value=1,
+    )
+    outcome = store_a.submit_batch(rec.session_id, 0, [winner])
+    assert outcome.revision == 1
+
+    loser = Operation(
+        actor="bob", seq=1, version={"bob": 1},
+        path="/count", action="set", value=2,
+    )
+    with pytest.raises(RevisionConflictError):
+        store_b.submit_batch(rec.session_id, 0, [loser])
+
+    # both instances read the committed operation and the latest revision
+    for store in (store_a, store_b):
+        state = store.get_state(rec.session_id)
+        assert state["revision"] == 1
+        assert state["document"] == {"count": 1}
+        assert state["version"] == {"alice": 1}
+
+
+def _racing_submitter(store_dir, session_id, actor, barrier, queue):
+    """Worker: read revision 0, wait for the other process, then submit."""
+    store = SessionStore(store_dir)
+    assert store.get(session_id).revision == 0
+    barrier.wait(timeout=15)
+    operation = Operation(
+        actor=actor, seq=1, version={actor: 1},
+        path=f"/{actor}", action="set", value=actor,
+    )
+    try:
+        store.submit_batch(session_id, 0, [operation])
+        status = "committed"
+    except RevisionConflictError:
+        status = "conflict"
+    # a fresh read (what GET /sessions/{id} serves) must show the winner
+    state = store.get_state(session_id)
+    queue.put((status, actor, state["revision"], state["document"]))
+
+
+def test_shared_store_dir_two_processes_only_one_commits(tmp_path):
+    # two real processes share the store directory; both read revision 0
+    # and race to submit different valid batches with expected_revision=0
+    store_dir = str(tmp_path / "sessions")
+    rec = SessionStore(store_dir).create({}, {})
+
+    ctx = multiprocessing.get_context("fork")
+    barrier = ctx.Barrier(2)
+    queue = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_racing_submitter,
+            args=(store_dir, rec.session_id, f"actor{i}", barrier, queue),
+        )
+        for i in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=60)
+        assert proc.exitcode == 0
+
+    results = [queue.get(timeout=10) for _ in procs]
+    assert sorted(r[0] for r in results) == ["committed", "conflict"]
+    winner = next(r[1] for r in results if r[0] == "committed")
+    # both processes observe the committed operation and the latest revision
+    for _, _, revision, document in results:
+        assert revision == 1
+        assert document == {winner: winner}
+
+    state = SessionStore(store_dir).get_state(rec.session_id)
+    assert state["revision"] == 1
+    assert state["document"] == {winner: winner}
+    assert state["version"] == {winner: 1}
