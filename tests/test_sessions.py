@@ -322,6 +322,161 @@ def test_concurrent_same_revision_only_one_commits(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# shared SESSION_STORE_DIR across processes
+# ---------------------------------------------------------------------------
+# Two SessionStore instances over one directory stand in for two service
+# processes: each has its own in-process lock and no shared memory, only the
+# filesystem is common -- and the per-session flock genuinely serializes
+# them, exactly as it would across OS processes.
+
+def make_op(actor, seq, version, path, action, value=None):
+    return Operation(
+        actor=actor, seq=seq, version=version, path=path, action=action, value=value
+    )
+
+
+def test_shared_directory_commit_visible_to_other_store(tmp_path):
+    store_dir = str(tmp_path / "sessions")
+    store_a = SessionStore(store_dir)
+    store_b = SessionStore(store_dir)
+    rec = store_a.create({"count": 0}, {})
+
+    # both "processes" have read revision 0
+    assert store_b.get(rec.session_id).revision == 0
+
+    outcome = store_a.submit_batch(
+        rec.session_id, 0, [make_op("alice", 1, {"alice": 1}, "/count", "set", 1)]
+    )
+    assert outcome.revision == 1
+
+    # the other process immediately reads the committed revision and state
+    assert store_b.get(rec.session_id).revision == 1
+    state = store_b.get_state(rec.session_id)
+    assert state["revision"] == 1
+    assert state["document"] == {"count": 1}
+    assert state["version"] == {"alice": 1}
+
+
+def test_shared_directory_stale_expected_revision_conflicts(tmp_path):
+    # both processes read revision 0, then race valid batches with
+    # expected_revision=0: only one commits, the loser gets a conflict and
+    # its operation is never written
+    store_dir = str(tmp_path / "sessions")
+    store_a = SessionStore(store_dir)
+    store_b = SessionStore(store_dir)
+    rec = store_a.create({}, {})
+    assert store_b.get(rec.session_id).revision == 0
+
+    store_a.submit_batch(
+        rec.session_id, 0, [make_op("alice", 1, {"alice": 1}, "/x", "set", 1)]
+    )
+    with pytest.raises(RevisionConflictError):
+        store_b.submit_batch(
+            rec.session_id, 0, [make_op("bob", 1, {"bob": 1}, "/y", "set", 2)]
+        )
+
+    # both processes read the winner's operation and the latest revision
+    for store in (store_a, store_b):
+        state = store.get_state(rec.session_id)
+        assert state["revision"] == 1
+        assert state["document"] == {"x": 1}
+        assert state["version"] == {"alice": 1}
+
+
+def test_shared_directory_sequential_commits_across_stores(tmp_path):
+    # after a cross-process conflict the loser retries against the fresh
+    # revision; the cumulative log still recomputes from the initial
+    # document and cross-process causal references resolve
+    store_dir = str(tmp_path / "sessions")
+    store_a = SessionStore(store_dir)
+    store_b = SessionStore(store_dir)
+    rec = store_a.create({"count": 0}, {})
+
+    store_a.submit_batch(
+        rec.session_id, 0, [make_op("alice", 1, {"alice": 1}, "/count", "set", 1)]
+    )
+    outcome = store_b.submit_batch(
+        rec.session_id,
+        1,
+        [make_op("bob", 1, {"alice": 1, "bob": 1}, "/count", "set", 2)],
+    )
+    assert outcome.revision == 2
+
+    state = store_a.get_state(rec.session_id)
+    assert state["revision"] == 2
+    assert state["document"] == {"count": 2}
+    assert state["version"] == {"alice": 1, "bob": 1}
+    assert state["conflicts"] == []  # causally ordered, not concurrent
+
+
+def test_shared_directory_concurrent_same_revision_only_one_commits(tmp_path):
+    # racing batches from two processes carrying the same expected revision
+    # cannot both succeed even though each process has its own in-process
+    # lock
+    store_dir = str(tmp_path / "sessions")
+    stores = [SessionStore(store_dir), SessionStore(store_dir)]
+    rec = stores[0].create({}, {})
+
+    def attempt(i):
+        try:
+            return stores[i % 2].submit_batch(
+                rec.session_id,
+                0,
+                [make_op(f"actor{i}", 1, {f"actor{i}": 1}, f"/k{i}", "set", i)],
+            )
+        except RevisionConflictError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(attempt, range(16)))
+
+    committed = [o for o in outcomes if o is not None]
+    assert len(committed) == 1
+    assert committed[0].revision == 1
+    # both processes agree on the single winner's state
+    for store in stores:
+        state = store.get_state(rec.session_id)
+        assert state["revision"] == 1
+        assert len(state["document"]) == 1
+
+
+def test_api_shared_store_dir_conflict(tmp_path):
+    # the full scenario over HTTP: two service instances (each with its own
+    # store) sharing one SESSION_STORE_DIR
+    store_a = SessionStore(str(tmp_path / "sessions"))
+    store_b = SessionStore(str(tmp_path / "sessions"))
+    client = TestClient(app)
+
+    app.state.session_store = store_a
+    sid = create_session(client, {"count": 0})
+
+    # both processes have read revision 0
+    assert client.get(f"/sessions/{sid}").json()["revision"] == 0
+    app.state.session_store = store_b
+    assert client.get(f"/sessions/{sid}").json()["revision"] == 0
+
+    # process A commits its batch
+    app.state.session_store = store_a
+    resp = submit(client, sid, 0, [op("alice", 1, {"alice": 1}, "/count", "set", 1)])
+    assert resp.status_code == 200
+    assert resp.json()["revision"] == 1
+
+    # process B commits a different valid batch with the same expected
+    # revision: 409, and nothing is written
+    app.state.session_store = store_b
+    resp = submit(client, sid, 0, [op("bob", 1, {"bob": 1}, "/count", "set", 2)])
+    assert resp.status_code == 409
+
+    # both processes read the winner's operation and the latest revision
+    for store in (store_a, store_b):
+        app.state.session_store = store
+        state = client.get(f"/sessions/{sid}").json()
+        assert state["revision"] == 1
+        assert state["document"] == {"count": 1}
+        assert state["version"] == {"alice": 1}
+
+
+# ---------------------------------------------------------------------------
 # durability
 # ---------------------------------------------------------------------------
 

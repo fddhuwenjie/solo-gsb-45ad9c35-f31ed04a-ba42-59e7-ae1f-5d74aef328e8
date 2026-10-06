@@ -599,11 +599,32 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   `expected_revision` 过期返回 `409`；会话不存在返回 `404`。这些失败
   都不会写入部分批次，会话保持原有修订与日志。
 - **并发提交**：同一 `expected_revision` 的并发提交只有一个能成功，
-  其余因修订号已推进而收到 `409`。
+  其余因修订号已推进而收到 `409`——即使两笔提交来自共用同一
+  `SESSION_STORE_DIR` 的**不同进程**（见下文「多进程共享
+  `SESSION_STORE_DIR`」）。
 - **持久化**：每个会话以 JSON 文件存于 `SESSION_STORE_DIR`（默认
   `./.sessions`；docker compose 中设为 `/data/sessions`，挂载命名卷
   `session-data`），`docker compose restart` 或 `down` + `up` 之后
   会话仍可读取、可继续提交。
+
+### 多进程共享 `SESSION_STORE_DIR`
+
+多个服务进程（如多个 uvicorn worker、挂载同一卷的多副本）可以共用同一个
+`SESSION_STORE_DIR`；此时并发控制不再只依赖进程内锁：
+
+- **跨进程互斥**：每个会话在目录内对应一个咨询锁文件
+  `.<session_id>.lock`（`fcntl.flock`）。批次提交的**修订检查、累计
+  日志重算与落盘**整个临界区都在该锁内完成；不同会话各有独立的锁，
+  互不阻塞。
+- **无进程内缓存**：每次请求都在锁内重新读取会话文件，任一进程的提交
+  对其余进程立即可见。两个进程都读过修订号 0、随后同时以
+  `expected_revision=0` 提交不同批次时，只有一笔成功（`200`），另一笔
+  收到 `409` 且不写入任何操作；任一进程随后的 `GET /sessions/{id}`
+  都能读到成功批次的操作与最新修订号，失败方用最新修订号重试即可继续。
+- **锁文件**：`*.lock` 文件随会话保留在目录中，服务运行期间不要删除；
+  需要文件系统支持 `flock`（本地卷与 docker compose 命名卷均可，NFS 等
+  网络文件系统可能不支持）。在没有 `fcntl` 的非 POSIX 平台上退化为仅
+  进程内互斥。
 
 ### 可执行示例
 
@@ -714,14 +735,14 @@ app/
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
   query.py     # 受限 JSONPath 解析与求值（只读、单查询 10000 节点预算）
   resolve.py   # 跨文档 $ref 物化：覆盖层合并、引用链循环检测、叶子来源映射
-  sessions.py  # 分批会话：累计日志、原子提交（校验+重算+修订）、JSON 文件持久化
+  sessions.py  # 分批会话：累计日志、原子提交（校验+重算+修订）、跨进程文件锁、JSON 文件持久化
 tests/
   test_api.py            # 22 个 merge/apply 端到端测试
   test_exclude.py        # 29 个 merge/apply 排除裁剪端到端测试
   test_route_changes.py  # 30 个 route-changes 端到端测试
   test_query.py          # 73 个 /query 端到端测试
   test_resolve.py        # 37 个 /resolve 端到端测试
-  test_sessions.py       # 20 个分批会话端到端测试
+  test_sessions.py       # 25 个分批会话端到端测试（含共享目录跨进程并发）
 conftest.py
 Dockerfile
 docker-compose.yml
